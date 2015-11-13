@@ -22,11 +22,14 @@ var RelayMutationRequest = require('RelayMutationRequest');
 var RelayMutationTransaction = require('RelayMutationTransaction');
 var RelayMutationTransactionStatus = require('RelayMutationTransactionStatus');
 var RelayNetworkLayer = require('RelayNetworkLayer');
-import type RelayStoreData from 'RelayStoreData';
 import type {FileMap} from 'RelayMutation';
 import type RelayMutation from 'RelayMutation';
 import type RelayQuery from 'RelayQuery';
-import type {ClientMutationID} from 'RelayInternalTypes';
+import type RelayQueryTracker from 'RelayQueryTracker';
+import type {
+  ClientMutationID,
+  UpdateOptions,
+} from 'RelayInternalTypes';
 import type {
   RelayMutationConfig,
   RelayMutationTransactionCommitCallbacks,
@@ -53,6 +56,19 @@ type TransactionData = {
 };
 type TransactionQueue = Array<PendingTransaction>;
 
+type RelayUpdateManager = {
+  clearQueuedRecords(): void;
+  handlePayload(
+    operation: RelayQuery.Operation,
+    payload: {[key: string]: mixed},
+    options: UpdateOptions,
+  ): void;
+};
+type RelayMutationQueueConfig = {
+  updateManager: RelayUpdateManager;
+  queryTracker: RelayQueryTracker;
+};
+
 const {CLIENT_MUTATION_ID} = RelayConnectionInterface;
 
 let transactionIDCounter = 0;
@@ -67,15 +83,20 @@ let transactionIDCounter = 0;
 class RelayMutationQueue {
   _collisionQueueMap: CollisionQueueMap;
   _pendingTransactionMap: PendingTransactionMap;
+  _updateManager: RelayUpdateManager;
+  _queryTracker: RelayQueryTracker;
   _queue: TransactionQueue;
-  _storeData: RelayStoreData;
   _willBatchRefreshQueuedData: boolean;
 
-  constructor(storeData: RelayStoreData) {
+  constructor({
+    updateManager,
+    queryTracker,
+  }: RelayMutationQueueConfig) {
     this._collisionQueueMap = {};
     this._pendingTransactionMap = {};
+    this._updateManager = updateManager;
+    this._queryTracker = queryTracker;
     this._queue = [];
-    this._storeData = storeData;
     this._willBatchRefreshQueuedData = false;
   }
 
@@ -147,11 +168,11 @@ class RelayMutationQueue {
 
   _handleOptimisticUpdate(transaction: PendingTransaction): void {
     const optimisticResponse = transaction.getOptimisticResponse();
-    const optimisticQuery = transaction.getOptimisticQuery(this._storeData);
+    const optimisticQuery = transaction.getOptimisticQuery(this._queryTracker);
     if (optimisticResponse && optimisticQuery) {
       const configs =
         transaction.getOptimisticConfigs() || transaction.getConfigs();
-      this._storeData.handleUpdatePayload(
+      this._updateManager.handlePayload(
         optimisticQuery,
         optimisticResponse,
         {
@@ -207,8 +228,8 @@ class RelayMutationQueue {
     this._clearPendingTransaction(transaction);
 
     this._refreshQueuedData();
-    this._storeData.handleUpdatePayload(
-      transaction.getQuery(this._storeData),
+    this._updateManager.handlePayload(
+      transaction.getQuery(this._queryTracker),
       response[transaction.getCallName()],
       {
         configs: transaction.getConfigs(),
@@ -233,7 +254,7 @@ class RelayMutationQueue {
     transaction.error = null;
 
     const request = new RelayMutationRequest(
-      transaction.getQuery(this._storeData),
+      transaction.getQuery(this._queryTracker),
       transaction.getFiles(),
     );
     RelayNetworkLayer.sendMutation(request);
@@ -293,7 +314,7 @@ class RelayMutationQueue {
   }
 
   _refreshQueuedData(): void {
-    this._storeData.clearQueuedData();
+    this._updateManager.clearQueuedRecords();
     this._queue.forEach(
       transaction => this._handleOptimisticUpdate(transaction)
     );
@@ -407,7 +428,7 @@ class PendingTransaction {
     return this._optimisticConfigs;
   }
 
-  getOptimisticQuery(storeData: RelayStoreData): ?RelayQuery.Mutation {
+  getOptimisticQuery(queryTracker: RelayQueryTracker): ?RelayQuery.Mutation {
     if (this._optimisticQuery === undefined) {
       var optimisticResponse = this.getOptimisticResponse();
       if (optimisticResponse) {
@@ -419,7 +440,7 @@ class PendingTransaction {
             input: this.getInputVariable(),
             mutationName: this.mutation.constructor.name,
             mutation: this.getMutationNode(),
-            tracker: storeData.getQueryTracker(),
+            tracker: queryTracker,
           });
         } else {
           this._optimisticQuery =
@@ -427,7 +448,7 @@ class PendingTransaction {
               response: optimisticResponse,
               fatQuery: this.getFatQuery(),
               mutation: this.getMutationNode(),
-              tracker: storeData.getQueryTracker(),
+              tracker: queryTracker,
             });
         }
       } else {
@@ -448,7 +469,7 @@ class PendingTransaction {
     return this._optimisticResponse;
   }
 
-  getQuery(storeData: RelayStoreData): RelayQuery.Mutation {
+  getQuery(queryTracker: RelayQueryTracker): RelayQuery.Mutation {
     if (!this._query) {
       this._query = RelayMutationQuery.buildQuery({
         configs: this.getConfigs(),
@@ -456,7 +477,7 @@ class PendingTransaction {
         input: this.getInputVariable(),
         mutationName: this.getMutationNode().name,
         mutation: this.getMutationNode(),
-        tracker: storeData.getQueryTracker(),
+        tracker: queryTracker,
       });
     }
     return this._query;

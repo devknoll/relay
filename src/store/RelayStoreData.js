@@ -42,6 +42,8 @@ var RelayRecordStore = require('RelayRecordStore');
 var RelayStoreGarbageCollector = require('RelayStoreGarbageCollector');
 import type {CacheManager, CacheReadCallbacks} from 'RelayTypes';
 
+var checkRelayQueryData = require('checkRelayQueryData');
+var diffRelayQuery = require('diffRelayQuery');
 var forEachObject = require('forEachObject');
 var invariant = require('invariant');
 var generateForceIndex = require('generateForceIndex');
@@ -117,17 +119,42 @@ class RelayStoreData {
     this._cachedRootCalls = cachedRootCallMap;
     this._changeEmitter = new GraphQLStoreChangeEmitter();
     this._deferredQueryTracker = new GraphQLDeferredQueryTracker(recordStore);
-    this._mutationQueue = new RelayMutationQueue(this);
+    this._queryTracker = new RelayQueryTracker();
     this._nodeRangeMap = nodeRangeMap;
-    this._pendingQueryTracker = new RelayPendingQueryTracker(this);
+
     this._rangeData = new GraphQLStoreRangeUtils();
     this._records = records;
-    this._queryTracker = new RelayQueryTracker();
-    this._queryRunner = new GraphQLQueryRunner(this);
     this._queuedRecords = queuedRecords;
     this._queuedStore = queuedStore;
     this._recordStore = recordStore;
     this._rootCalls = rootCallMap;
+
+    this._mutationQueue = new RelayMutationQueue({
+      queryTracker: this._queryTracker,
+      updateManager: {
+        clearQueuedRecords: this.clearQueuedData.bind(this),
+        handlePayload: this.handleUpdatePayload.bind(this),
+      },
+    });
+
+    this._pendingQueryTracker = new RelayPendingQueryTracker({
+      deferredQueryTracker: this._deferredQueryTracker,
+      queryManager: {
+        handlePayload: this.handleQueryPayload.bind(this),
+      },
+    });
+
+    this._queryRunner = new GraphQLQueryRunner({
+      cacheReader: {
+        isAvailable: this.hasCacheManager.bind(this),
+        read: this.readFromDiskCache.bind(this),
+      },
+      pendingQueryTracker: this._pendingQueryTracker,
+      queryChecker: (query: RelayQuery.Root) =>
+        checkRelayQueryData(this._queuedStore, query),
+      queryDiffer: (query: RelayQuery.Root) =>
+        diffRelayQuery(query, this._recordStore, this._queryTracker),
+    });
   }
 
   /**

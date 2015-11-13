@@ -15,10 +15,10 @@
 
 var Deferred = require('Deferred');
 var DliteFetchModeConstants = require('DliteFetchModeConstants');
+import type GraphQLDeferredQueryTracker from 'GraphQLDeferredQueryTracker';
 var Promise = require('Promise');
 var PromiseMap = require('PromiseMap');
 import type RelayQuery from 'RelayQuery';
-import type RelayStoreData from 'RelayStoreData';
 var RelayTaskScheduler = require('RelayTaskScheduler');
 import type {QueryResult} from 'RelayTypes';
 
@@ -38,6 +38,19 @@ type PendingState = {
   query: RelayQuery.Root;
 };
 
+type RelayQueryManager = {
+  handlePayload(
+    query: RelayQuery.Root,
+    response: {[key: string]: mixed},
+    forceIndex: ?number
+  ): void;
+}
+
+type PendingFetchOptions = {
+  queryManager: RelayQueryManager;
+  deferredQueryTracker: GraphQLDeferredQueryTracker;
+};
+
 var pendingFetchMap: {[queryID: string]: PendingState} = {};
 
 // Asynchronous mapping from preload query IDs to results.
@@ -45,9 +58,11 @@ var preloadQueryMap: PromiseMap<Object, Error> = new PromiseMap();
 
 class PendingFetch {
   _query: RelayQuery.Root;
+  _queryManager: RelayQueryManager;
 
   _forceIndex: ?number;
 
+  _deferredQueryTracker: GraphQLDeferredQueryTracker;
   _dependents: Array<PendingFetch>;
   _pendingDependencyMap: {[queryID: string]: PendingFetch};
 
@@ -56,8 +71,6 @@ class PendingFetch {
 
   _resolvedSubtractedQuery: boolean;
   _resolvedDeferred: Deferred<void, ?Error>;
-
-  _storeData: RelayStoreData;
 
   /**
    * Error(s) in fetching/handleUpdate-ing its or one of its pending
@@ -68,17 +81,19 @@ class PendingFetch {
 
   constructor(
     {fetchMode, forceIndex, query}: PendingQueryParameters,
-    storeData: RelayStoreData
+    {queryManager, deferredQueryTracker}: PendingFetchOptions
   ) {
     var queryID = query.getID();
-    this._storeData = storeData;
+
     this._query = query;
+    this._queryManager = queryManager;
     this._forceIndex = forceIndex;
 
     this._resolvedSubtractedQuery = false;
     this._resolvedDeferred = new Deferred();
 
     this._dependents = [];
+    this._deferredQueryTracker = deferredQueryTracker;
     this._pendingDependencyMap = {};
 
     var subtractedQuery;
@@ -100,9 +115,7 @@ class PendingFetch {
         fetch: this,
         query: subtractedQuery,
       };
-      this._storeData.getDeferredQueryTracker().recordQuery(
-        subtractedQuery
-      );
+      this._deferredQueryTracker.recordQuery(subtractedQuery);
       this._fetchSubtractedQueryPromise.done(
         this._handleSubtractedQuerySuccess.bind(this, subtractedQuery),
         this._handleSubtractedQueryFailure.bind(this, subtractedQuery)
@@ -167,12 +180,12 @@ class PendingFetch {
         '`%s`.',
         response ? typeof response : response
       );
-      this._storeData.handleQueryPayload(
+      this._queryManager.handlePayload(
         subtractedQuery,
         response,
         this._forceIndex
       );
-      this._storeData.getDeferredQueryTracker().resolveQuery(
+      this._deferredQueryTracker.resolveQuery(
         subtractedQuery,
         response,
         result.ref_params
@@ -187,11 +200,7 @@ class PendingFetch {
     subtractedQuery: RelayQuery.Root,
     error: Error
   ): void {
-    this._storeData.getDeferredQueryTracker().rejectQuery(
-      subtractedQuery,
-      error
-    );
-
+    this._deferredQueryTracker.rejectQuery(subtractedQuery, error);
     this._markAsRejected(error);
   }
 
@@ -292,17 +301,17 @@ function hasItems(map: Object): boolean {
  * "subtracts" those from any new queries that callers enqueue.
  */
 class RelayPendingQueryTracker {
-  _storeData: RelayStoreData;
+  _options: PendingFetchOptions;
 
-  constructor(storeData: RelayStoreData) {
-    this._storeData = storeData;
+  constructor(options: PendingFetchOptions) {
+    this._options = options;
   }
 
   /**
    * Used by `GraphQLQueryRunner` to enqueue new queries.
    */
   add(params: PendingQueryParameters): PendingFetch {
-    return new PendingFetch(params, this._storeData);
+    return new PendingFetch(params, this._options);
   }
 
   hasPendingQueries(): boolean {

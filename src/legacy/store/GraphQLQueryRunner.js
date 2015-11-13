@@ -18,12 +18,10 @@ import type {RelayQuerySet} from 'RelayInternalTypes';
 import type {PendingFetch} from 'RelayPendingQueryTracker';
 var RelayNetworkLayer = require('RelayNetworkLayer');
 var RelayProfiler = require('RelayProfiler');
+import type RelayPendingQueryTracker from 'RelayPendingQueryTracker';
 import type RelayQuery from 'RelayQuery';
-import type RelayStoreData from 'RelayStoreData';
 var RelayTaskScheduler = require('RelayTaskScheduler');
 
-var checkRelayQueryData = require('checkRelayQueryData');
-var diffRelayQuery = require('diffRelayQuery');
 var everyObject = require('everyObject');
 var flattenSplitRelayQueries = require('flattenSplitRelayQueries');
 var forEachObject = require('forEachObject');
@@ -37,7 +35,8 @@ var warning = require('warning');
 
 import type {
   Abortable,
-  ReadyStateChangeCallback
+  ReadyStateChangeCallback,
+  CacheReadCallbacks
 } from 'RelayTypes';
 
 type PartialReadyState = {
@@ -48,6 +47,20 @@ type PartialReadyState = {
   stale?: boolean;
 };
 type RelayProfileHandler = {stop: () => void};
+
+type RelayCacheReader = {
+  isAvailable(): boolean;
+  read(queries: RelayQuerySet, callbacks: CacheReadCallbacks): void;
+}
+type RelayQueryChecker = (query: RelayQuery.Root) => boolean;
+type RelayQueryDiffer = (query: RelayQuery.Root) => Array<RelayQuery.Root>;
+
+type GraphQLQueryRunnerOptions = {
+  cacheReader: RelayCacheReader;
+  pendingQueryTracker: RelayPendingQueryTracker;
+  queryChecker: RelayQueryChecker;
+  queryDiffer: RelayQueryDiffer;
+}
 
 /**
  * This is the high-level entry point for sending queries to the GraphQL
@@ -61,10 +74,21 @@ type RelayProfileHandler = {stop: () => void};
  * @internal
  */
 class GraphQLQueryRunner {
-  _storeData: RelayStoreData;
+  _cacheReader: RelayCacheReader;
+  _pendingQueryTracker: RelayPendingQueryTracker;
+  _queryChecker: RelayQueryChecker;
+  _queryDiffer: RelayQueryDiffer;
 
-  constructor(storeData: RelayStoreData) {
-    this._storeData = storeData;
+  constructor({
+    cacheReader,
+    pendingQueryTracker,
+    queryChecker,
+    queryDiffer,
+  }: GraphQLQueryRunnerOptions) {
+    this._cacheReader = cacheReader;
+    this._pendingQueryTracker = pendingQueryTracker;
+    this._queryChecker = queryChecker;
+    this._queryDiffer = queryDiffer;
   }
 
   /**
@@ -87,11 +111,7 @@ class GraphQLQueryRunner {
     if (fetchMode === DliteFetchModeConstants.FETCH_MODE_CLIENT) {
       forEachObject(querySet, query => {
         if (query) {
-          diffQueries.push(...diffRelayQuery(
-            query,
-            this._storeData.getRecordStore(),
-            this._storeData.getQueryTracker()
-          ));
+          diffQueries.push(...this._queryDiffer(query));
         }
       });
     } else {
@@ -102,8 +122,7 @@ class GraphQLQueryRunner {
       });
     }
 
-    return runQueries(
-      this._storeData,
+    return this._runQueries(
       diffQueries,
       callback,
       fetchMode,
@@ -129,7 +148,156 @@ class GraphQLQueryRunner {
       query && queries.push(query);
     });
 
-    return runQueries(this._storeData, queries, callback, fetchMode, profiler);
+    return this._runQueries(
+      queries,
+      callback,
+      fetchMode, profiler
+    );
+  }
+
+  _runQueries(
+    queries: Array<RelayQuery.Root>,
+    callback: ReadyStateChangeCallback,
+    fetchMode: string,
+    profiler: RelayProfileHandler
+  ): Abortable {
+    var readyState = {
+      aborted: false,
+      done: false,
+      error: null,
+      ready: false,
+      stale: false,
+    };
+    var scheduled = false;
+    function setReadyState(partial: PartialReadyState): void {
+      if (readyState.aborted) {
+        return;
+      }
+      if (readyState.done || readyState.error) {
+        invariant(
+          partial.aborted,
+          'GraphQLQueryRunner: Unexpected ready state change.'
+        );
+        return;
+      }
+      readyState = {
+        aborted: partial.aborted != null ? partial.aborted : readyState.aborted,
+        done: partial.done != null ? partial.done : readyState.done,
+        error: partial.error != null ? partial.error : readyState.error,
+        ready: partial.ready != null ? partial.ready : readyState.ready,
+        stale: partial.stale != null ? partial.stale : readyState.stale,
+      };
+      if (scheduled) {
+        return;
+      }
+      scheduled = true;
+      resolveImmediate(() => {
+        scheduled = false;
+        callback(readyState);
+      });
+    }
+
+    var remainingFetchMap: {[queryID: string]: PendingFetch} = {};
+    var remainingRequiredFetchMap: {[queryID: string]: PendingFetch} = {};
+
+    function onResolved(pendingFetch: PendingFetch) {
+      var pendingQuery = pendingFetch.getQuery();
+      var pendingQueryID = pendingQuery.getID();
+      delete remainingFetchMap[pendingQueryID];
+      if (!pendingQuery.isDeferred()) {
+        delete remainingRequiredFetchMap[pendingQueryID];
+      }
+
+      if (hasItems(remainingRequiredFetchMap)) {
+        return;
+      }
+
+      if (someObject(remainingFetchMap, query => query.isResolvable())) {
+        // The other resolvable query will resolve imminently and call
+        // `setReadyState` instead.
+        return;
+      }
+
+      if (hasItems(remainingFetchMap)) {
+        setReadyState({done: false, ready: true, stale: false});
+      } else {
+        setReadyState({done: true, ready: true, stale: false});
+      }
+    }
+
+    function onRejected(pendingFetch: PendingFetch, error: Error) {
+      setReadyState({error});
+
+      var pendingQuery = pendingFetch.getQuery();
+      var pendingQueryID = pendingQuery.getID();
+      delete remainingFetchMap[pendingQueryID];
+      if (!pendingQuery.isDeferred()) {
+        delete remainingRequiredFetchMap[pendingQueryID];
+      }
+    }
+
+    function canResolve(fetch: PendingFetch): boolean {
+      return this._queryChecker(fetch.getQuery());
+    }
+
+    RelayTaskScheduler.await(() => {
+      var forceIndex = fetchMode === DliteFetchModeConstants.FETCH_MODE_REFETCH ?
+        generateForceIndex() : null;
+
+      splitAndFlattenQueries(queries).forEach(query => {
+        var pendingFetch = this._pendingQueryTracker.add(
+          {query, fetchMode, forceIndex}
+        );
+        var queryID = query.getID();
+        remainingFetchMap[queryID] = pendingFetch;
+        if (!query.isDeferred()) {
+          remainingRequiredFetchMap[queryID] = pendingFetch;
+        }
+        pendingFetch.getResolvedPromise().then(
+          onResolved.bind(null, pendingFetch),
+          onRejected.bind(null, pendingFetch)
+        );
+      });
+
+      if (!hasItems(remainingFetchMap)) {
+        setReadyState({done: true, ready: true});
+      } else {
+        if (!hasItems(remainingRequiredFetchMap)) {
+          setReadyState({ready: true});
+        } else {
+          setReadyState({ready: false});
+          resolveImmediate(() => {
+            if (this._cacheReader.isAvailable()) {
+              var requiredQueryMap = mapObject(
+                remainingRequiredFetchMap,
+                value => value.getQuery()
+              );
+              this._cacheReader.read(requiredQueryMap, {
+                onSuccess: () => {
+                  if (hasItems(remainingRequiredFetchMap)) {
+                    setReadyState({ready: true, stale: true});
+                  }
+                },
+              });
+            } else {
+              if (everyObject(remainingRequiredFetchMap, canResolve)) {
+                if (hasItems(remainingRequiredFetchMap)) {
+                  setReadyState({ready: true, stale: true});
+                }
+              }
+            }
+          });
+        }
+      }
+      // Stop profiling when queries have been sent to the network layer.
+      profiler.stop();
+    }).done();
+
+    return {
+      abort(): void {
+        setReadyState({aborted: true});
+      },
+    };
   }
 }
 
@@ -167,155 +335,6 @@ function splitAndFlattenQueries(
     );
   });
   return flattenedQueries;
-}
-
-function runQueries(
-  storeData: RelayStoreData,
-  queries: Array<RelayQuery.Root>,
-  callback: ReadyStateChangeCallback,
-  fetchMode: string,
-  profiler: RelayProfileHandler
-): Abortable {
-  var readyState = {
-    aborted: false,
-    done: false,
-    error: null,
-    ready: false,
-    stale: false,
-  };
-  var scheduled = false;
-  function setReadyState(partial: PartialReadyState): void {
-    if (readyState.aborted) {
-      return;
-    }
-    if (readyState.done || readyState.error) {
-      invariant(
-        partial.aborted,
-        'GraphQLQueryRunner: Unexpected ready state change.'
-      );
-      return;
-    }
-    readyState = {
-      aborted: partial.aborted != null ? partial.aborted : readyState.aborted,
-      done: partial.done != null ? partial.done : readyState.done,
-      error: partial.error != null ? partial.error : readyState.error,
-      ready: partial.ready != null ? partial.ready : readyState.ready,
-      stale: partial.stale != null ? partial.stale : readyState.stale,
-    };
-    if (scheduled) {
-      return;
-    }
-    scheduled = true;
-    resolveImmediate(() => {
-      scheduled = false;
-      callback(readyState);
-    });
-  }
-
-  var remainingFetchMap: {[queryID: string]: PendingFetch} = {};
-  var remainingRequiredFetchMap: {[queryID: string]: PendingFetch} = {};
-
-  function onResolved(pendingFetch: PendingFetch) {
-    var pendingQuery = pendingFetch.getQuery();
-    var pendingQueryID = pendingQuery.getID();
-    delete remainingFetchMap[pendingQueryID];
-    if (!pendingQuery.isDeferred()) {
-      delete remainingRequiredFetchMap[pendingQueryID];
-    }
-
-    if (hasItems(remainingRequiredFetchMap)) {
-      return;
-    }
-
-    if (someObject(remainingFetchMap, query => query.isResolvable())) {
-      // The other resolvable query will resolve imminently and call
-      // `setReadyState` instead.
-      return;
-    }
-
-    if (hasItems(remainingFetchMap)) {
-      setReadyState({done: false, ready: true, stale: false});
-    } else {
-      setReadyState({done: true, ready: true, stale: false});
-    }
-  }
-
-  function onRejected(pendingFetch: PendingFetch, error: Error) {
-    setReadyState({error});
-
-    var pendingQuery = pendingFetch.getQuery();
-    var pendingQueryID = pendingQuery.getID();
-    delete remainingFetchMap[pendingQueryID];
-    if (!pendingQuery.isDeferred()) {
-      delete remainingRequiredFetchMap[pendingQueryID];
-    }
-  }
-
-  function canResolve(fetch: PendingFetch): boolean {
-    return checkRelayQueryData(
-      storeData.getQueuedStore(),
-      fetch.getQuery()
-    );
-  }
-
-  RelayTaskScheduler.await(() => {
-    var forceIndex = fetchMode === DliteFetchModeConstants.FETCH_MODE_REFETCH ?
-      generateForceIndex() : null;
-
-    splitAndFlattenQueries(queries).forEach(query => {
-      var pendingFetch = storeData.getPendingQueryTracker().add(
-        {query, fetchMode, forceIndex, storeData}
-      );
-      var queryID = query.getID();
-      remainingFetchMap[queryID] = pendingFetch;
-      if (!query.isDeferred()) {
-        remainingRequiredFetchMap[queryID] = pendingFetch;
-      }
-      pendingFetch.getResolvedPromise().then(
-        onResolved.bind(null, pendingFetch),
-        onRejected.bind(null, pendingFetch)
-      );
-    });
-
-    if (!hasItems(remainingFetchMap)) {
-      setReadyState({done: true, ready: true});
-    } else {
-      if (!hasItems(remainingRequiredFetchMap)) {
-        setReadyState({ready: true});
-      } else {
-        setReadyState({ready: false});
-        resolveImmediate(() => {
-          if (storeData.hasCacheManager()) {
-            var requiredQueryMap = mapObject(
-              remainingRequiredFetchMap,
-              value => value.getQuery()
-            );
-            storeData.readFromDiskCache(requiredQueryMap, {
-              onSuccess: () => {
-                if (hasItems(remainingRequiredFetchMap)) {
-                  setReadyState({ready: true, stale: true});
-                }
-              },
-            });
-          } else {
-            if (everyObject(remainingRequiredFetchMap, canResolve)) {
-              if (hasItems(remainingRequiredFetchMap)) {
-                setReadyState({ready: true, stale: true});
-              }
-            }
-          }
-        });
-      }
-    }
-    // Stop profiling when queries have been sent to the network layer.
-    profiler.stop();
-  }).done();
-
-  return {
-    abort(): void {
-      setReadyState({aborted: true});
-    },
-  };
 }
 
 module.exports = GraphQLQueryRunner;
